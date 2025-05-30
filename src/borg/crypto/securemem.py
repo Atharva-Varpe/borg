@@ -32,6 +32,7 @@ _libsodium.sodium_memzero.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 class SecureMemory:
     """
     Secure memory buffer using libsodium's sodium_malloc and sodium_free.
+    Now supports context manager and explicit close.
     """
     def __init__(self, size):
         self.size = size
@@ -42,15 +43,28 @@ class SecureMemory:
             _libsodium.sodium_free(self.ptr)
             raise MemoryError("sodium_mlock failed")
         self._as_parameter_ = ctypes.c_void_p(self.ptr)
+        self._closed = False
 
-    def __del__(self):
-        if hasattr(self, 'ptr') and self.ptr:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if not self._closed and hasattr(self, 'ptr') and self.ptr:
             _libsodium.sodium_memzero(self.ptr, self.size)
             _libsodium.sodium_munlock(self.ptr, self.size)
             _libsodium.sodium_free(self.ptr)
             self.ptr = None
+            self._closed = True
+
+    def __del__(self):
+        self.close()
 
     def write(self, data: bytes):
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
         if len(data) > self.size:
             raise ValueError("data too large for secure buffer")
         ctypes.memmove(self.ptr, data, len(data))
