@@ -30,6 +30,7 @@ from ..repoobj import RepoObj
 from .low_level import AES, bytes_to_int, num_cipher_blocks, hmac_sha256, blake2b_256
 from .low_level import AES256_CTR_HMAC_SHA256, AES256_CTR_BLAKE2b, AES256_OCB, CHACHA20_POLY1305
 from . import low_level
+from .securemem import SecureMemory
 
 # workaround for lost passphrase or key in "authenticated" or "authenticated-blake2" mode
 AUTHENTICATED_NO_KEY = "authenticated_no_key" in workarounds
@@ -174,6 +175,47 @@ class KeyBase:
         self.repository = repository
         self.target = None  # key location file path / repo obj
         self.copy_crypt_key = False
+        self._crypt_key_mem = None
+        self._id_key_mem = None
+        self.chunk_seed = None
+
+    @property
+    def crypt_key(self):
+        if self._crypt_key_mem:
+            return self._crypt_key_mem.read()
+        return None
+
+    @crypt_key.setter
+    def crypt_key(self, value):
+        if self._crypt_key_mem:
+            self._crypt_key_mem.zero()
+            self._crypt_key_mem = None
+        if value is not None:
+            self._crypt_key_mem = SecureMemory(len(value))
+            self._crypt_key_mem.write(value)
+
+    @property
+    def id_key(self):
+        if self._id_key_mem:
+            return self._id_key_mem.read()
+        return None
+
+    @id_key.setter
+    def id_key(self, value):
+        if self._id_key_mem:
+            self._id_key_mem.zero()
+            self._id_key_mem = None
+        if value is not None:
+            self._id_key_mem = SecureMemory(len(value))
+            self._id_key_mem.write(value)
+
+    def __del__(self):
+        if hasattr(self, '_crypt_key_mem') and self._crypt_key_mem:
+            self._crypt_key_mem.zero()
+            self._crypt_key_mem = None
+        if hasattr(self, '_id_key_mem') and self._id_key_mem:
+            self._id_key_mem.zero()
+            self._id_key_mem = None
 
     def id_hash(self, data):
         """Return HMAC hash using the "id" HMAC key"""
@@ -751,8 +793,7 @@ class AuthenticatedKeyBase(AESKeyBase, FlexiKey):
             # fake _load if we have no key or passphrase
             NOPE = bytes(32)  # 256 bit all-zero
             self.repository_id = NOPE
-            self.enc_key = NOPE
-            self.enc_hmac_key = NOPE
+            self.crypt_key = NOPE + NOPE  # 64 bytes
             self.id_key = NOPE
             self.chunk_seed = 0
             return True
@@ -905,30 +946,20 @@ class AEADKeyBase(KeyBase):
         # in every new session we start with a fresh sessionid and at iv == 0, manifest_data and iv params are ignored
         self.sessionid = os.urandom(24)
         self.cipher = self._get_cipher(self.sessionid, iv=0)
-
-
-class AESOCBKeyfileKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
-    TYPES_ACCEPTABLE = {KeyType.AESOCBKEYFILE, KeyType.AESOCBREPO}
-    TYPE = KeyType.AESOCBKEYFILE
-    NAME = "key file AES-OCB"
-    ARG_NAME = "keyfile-aes-ocb"
-    STORAGE = KeyBlobStorage.KEYFILE
-    CIPHERSUITE = AES256_OCB
-
-
-class AESOCBRepoKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
-    TYPES_ACCEPTABLE = {KeyType.AESOCBKEYFILE, KeyType.AESOCBREPO}
-    TYPE = KeyType.AESOCBREPO
-    NAME = "repokey AES-OCB"
-    ARG_NAME = "repokey-aes-ocb"
-    STORAGE = KeyBlobStorage.REPO
-    CIPHERSUITE = AES256_OCB
+        if manifest_data is not None:
+            self.assert_type(manifest_data[0])
+            # manifest_blocks is a safe upper bound on the amount of cipher blocks needed
+            # to encrypt the manifest. depending on the ciphersuite and overhead, it might
+            # be a bit too high, but that does not matter.
+            manifest_blocks = num_cipher_blocks(len(manifest_data))
+            nonce = self.cipher.extract_iv(manifest_data) + manifest_blocks
+            self.cipher.set_iv(nonce)
 
 
 class CHPOKeyfileKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
     TYPES_ACCEPTABLE = {KeyType.CHPOKEYFILE, KeyType.CHPOREPO}
     TYPE = KeyType.CHPOKEYFILE
-    NAME = "key file ChaCha20-Poly1305"
+    NAME = "key file chacha20-poly1305"
     ARG_NAME = "keyfile-chacha20-poly1305"
     STORAGE = KeyBlobStorage.KEYFILE
     CIPHERSUITE = CHACHA20_POLY1305
@@ -937,34 +968,16 @@ class CHPOKeyfileKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
 class CHPORepoKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
     TYPES_ACCEPTABLE = {KeyType.CHPOKEYFILE, KeyType.CHPOREPO}
     TYPE = KeyType.CHPOREPO
-    NAME = "repokey ChaCha20-Poly1305"
+    NAME = "repokey chacha20-poly1305"
     ARG_NAME = "repokey-chacha20-poly1305"
     STORAGE = KeyBlobStorage.REPO
     CIPHERSUITE = CHACHA20_POLY1305
 
 
-class Blake2AESOCBKeyfileKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
-    TYPES_ACCEPTABLE = {KeyType.BLAKE2AESOCBKEYFILE, KeyType.BLAKE2AESOCBREPO}
-    TYPE = KeyType.BLAKE2AESOCBKEYFILE
-    NAME = "key file BLAKE2b AES-OCB"
-    ARG_NAME = "keyfile-blake2-aes-ocb"
-    STORAGE = KeyBlobStorage.KEYFILE
-    CIPHERSUITE = AES256_OCB
-
-
-class Blake2AESOCBRepoKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
-    TYPES_ACCEPTABLE = {KeyType.BLAKE2AESOCBKEYFILE, KeyType.BLAKE2AESOCBREPO}
-    TYPE = KeyType.BLAKE2AESOCBREPO
-    NAME = "repokey BLAKE2b AES-OCB"
-    ARG_NAME = "repokey-blake2-aes-ocb"
-    STORAGE = KeyBlobStorage.REPO
-    CIPHERSUITE = AES256_OCB
-
-
 class Blake2CHPOKeyfileKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
     TYPES_ACCEPTABLE = {KeyType.BLAKE2CHPOKEYFILE, KeyType.BLAKE2CHPOREPO}
     TYPE = KeyType.BLAKE2CHPOKEYFILE
-    NAME = "key file BLAKE2b ChaCha20-Poly1305"
+    NAME = "key file blake2-chacha20-poly1305"
     ARG_NAME = "keyfile-blake2-chacha20-poly1305"
     STORAGE = KeyBlobStorage.KEYFILE
     CIPHERSUITE = CHACHA20_POLY1305
@@ -973,33 +986,43 @@ class Blake2CHPOKeyfileKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
 class Blake2CHPORepoKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
     TYPES_ACCEPTABLE = {KeyType.BLAKE2CHPOKEYFILE, KeyType.BLAKE2CHPOREPO}
     TYPE = KeyType.BLAKE2CHPOREPO
-    NAME = "repokey BLAKE2b ChaCha20-Poly1305"
+    NAME = "repokey blake2-chacha20-poly1305"
     ARG_NAME = "repokey-blake2-chacha20-poly1305"
     STORAGE = KeyBlobStorage.REPO
     CIPHERSUITE = CHACHA20_POLY1305
 
 
-LEGACY_KEY_TYPES = (
-    # legacy (AES-CTR based) crypto
-    KeyfileKey,
-    RepoKey,
-    Blake2KeyfileKey,
-    Blake2RepoKey,
-)
+class AESOCBKeyfileKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
+    TYPES_ACCEPTABLE = {KeyType.AESOCBKEYFILE, KeyType.AESOCBREPO}
+    TYPE = KeyType.AESOCBKEYFILE
+    NAME = "key file aesocb"
+    ARG_NAME = "keyfile-aesocb"
+    STORAGE = KeyBlobStorage.KEYFILE
+    CIPHERSUITE = AES256_OCB
 
-AVAILABLE_KEY_TYPES = (
-    # these are available encryption modes for new repositories
-    # not encrypted modes
-    PlaintextKey,
-    AuthenticatedKey,
-    Blake2AuthenticatedKey,
-    # new crypto
-    AESOCBKeyfileKey,
-    AESOCBRepoKey,
-    CHPOKeyfileKey,
-    CHPORepoKey,
-    Blake2AESOCBKeyfileKey,
-    Blake2AESOCBRepoKey,
-    Blake2CHPOKeyfileKey,
-    Blake2CHPORepoKey,
-)
+
+class AESOCBRepoKey(ID_HMAC_SHA_256, AEADKeyBase, FlexiKey):
+    TYPES_ACCEPTABLE = {KeyType.AESOCBKEYFILE, KeyType.AESOCBREPO}
+    TYPE = KeyType.AESOCBREPO
+    NAME = "repokey aesocb"
+    ARG_NAME = "repokey-aesocb"
+    STORAGE = KeyBlobStorage.REPO
+    CIPHERSUITE = AES256_OCB
+
+
+class Blake2AESOCBKeyfileKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
+    TYPES_ACCEPTABLE = {KeyType.BLAKE2AESOCBKEYFILE, KeyType.BLAKE2AESOCBREPO}
+    TYPE = KeyType.BLAKE2AESOCBKEYFILE
+    NAME = "key file blake2-aesocb"
+    ARG_NAME = "keyfile-blake2-aesocb"
+    STORAGE = KeyBlobStorage.KEYFILE
+    CIPHERSUITE = AES256_OCB
+
+
+class Blake2AESOCBRepoKey(ID_BLAKE2b_256, AEADKeyBase, FlexiKey):
+    TYPES_ACCEPTABLE = {KeyType.BLAKE2AESOCBKEYFILE, KeyType.BLAKE2AESOCBREPO}
+    TYPE = KeyType.BLAKE2AESOCBREPO
+    NAME = "repokey blake2-aesocb"
+    ARG_NAME = "repokey-blake2-aesocb"
+    STORAGE = KeyBlobStorage.REPO
+    CIPHERSUITE = AES256_OCB
